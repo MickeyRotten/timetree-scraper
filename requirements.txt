@@ -1,0 +1,5 @@
+timetree-exporter>=0.7.0
+
+# Optional: needed only for --google-calendar / --google-only
+google-api-python-client>=2.0
+google-auth-oauthlib>=1.0
