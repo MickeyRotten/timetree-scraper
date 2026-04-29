@@ -110,6 +110,9 @@ def _google_auth_and_pick_calendar(cfg: dict):
     """Run OAuth flow and let user pick a target Google Calendar."""
     ensure_google_deps()
 
+    import logging
+    logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
+
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
@@ -123,9 +126,11 @@ def _google_auth_and_pick_calendar(cfg: dict):
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            print("\n  A browser window will open for Google authorization...")
+            print("\n  Opening your browser for Google authorization...")
+            print("  (If no browser opens, copy the URL that appears and paste it manually.)")
             flow = InstalledAppFlow.from_client_secrets_file(str(CREDS_FILE), GOOGLE_SCOPES)
-            creds = flow.run_local_server(port=0)
+            creds = flow.run_local_server(port=0, open_browser=True)
+            print("  Authorization complete.")
         TOKEN_FILE.write_text(creds.to_json())
 
     service = build("calendar", "v3", credentials=creds)
@@ -345,6 +350,10 @@ def fetch_ical(cfg: dict):
 
 def _google_service():
     ensure_google_deps()
+
+    import logging
+    logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
+
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
@@ -357,8 +366,11 @@ def _google_service():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
+            print("Opening your browser for Google authorization...")
+            print("(If no browser opens, copy the URL that appears and paste it manually.)")
             flow = InstalledAppFlow.from_client_secrets_file(str(CREDS_FILE), GOOGLE_SCOPES)
-            creds = flow.run_local_server(port=0)
+            creds = flow.run_local_server(port=0, open_browser=True)
+            print("Authorization complete.")
         TOKEN_FILE.write_text(creds.to_json())
     return build("calendar", "v3", credentials=creds)
 
