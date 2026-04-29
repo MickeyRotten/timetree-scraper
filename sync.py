@@ -2,10 +2,13 @@
 """
 Export TimeTree calendar events to an .ics file and optionally sync to Google Calendar.
 
+On each run, events are compared against a local cache (timetree_cache.json).
+The ICS is only rewritten and Google Calendar is only updated when something changed.
+
 Usage:
     python sync.py                          # interactive prompts
     python sync.py --output calendar.ics
-    python sync.py --google-calendar        # also push to Google Calendar
+    python sync.py --google-calendar        # also push diff to Google Calendar
 
 Credentials via environment variables (recommended):
     TIMETREE_EMAIL=you@example.com
@@ -21,12 +24,15 @@ Google Calendar setup (one-time):
 """
 
 import argparse
+import json
 import os
 import sys
+from datetime import datetime, date
 from pathlib import Path
 
-from timetree_exporter.api.auth import login, AuthenticationError
-from timetree_exporter.api.calendar import TimeTreeCalendar
+from icalendar import Calendar as ICalendar
+
+from timetree_exporter.api.auth import AuthenticationError
 from timetree_exporter.utils import safe_getpass
 from timetree_exporter.__main__ import (
     build_single_calendar,
@@ -35,6 +41,12 @@ from timetree_exporter.__main__ import (
     select_calendar,
 )
 
+CACHE_FILE = Path("timetree_cache.json")
+
+
+# ---------------------------------------------------------------------------
+# Credentials
+# ---------------------------------------------------------------------------
 
 def resolve_credentials():
     email = os.environ.get("TIMETREE_EMAIL") or input("TimeTree email: ")
@@ -43,7 +55,76 @@ def resolve_credentials():
     return email, password, calendar_code
 
 
-def export_ics(output: str) -> str:
+# ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+def _serialize(val):
+    """Convert an icalendar property value to a JSON-safe string."""
+    if val is None:
+        return ""
+    if hasattr(val, "dt"):
+        val = val.dt
+    if isinstance(val, (datetime, date)):
+        return val.isoformat()
+    return str(val).strip()
+
+
+def fingerprint(component) -> dict:
+    """Extract the fields we care about from a VEVENT component."""
+    return {
+        "summary": _serialize(component.get("SUMMARY")),
+        "dtstart": _serialize(component.get("DTSTART")),
+        "dtend": _serialize(component.get("DTEND")),
+        "description": _serialize(component.get("DESCRIPTION")),
+        "location": _serialize(component.get("LOCATION")),
+    }
+
+
+def ics_to_cache(ics_path: str) -> dict:
+    """Build a {uid: fingerprint} dict from an ICS file."""
+    with open(ics_path, "rb") as f:
+        cal = ICalendar.from_ical(f.read())
+    cache = {}
+    for component in cal.walk():
+        if component.name != "VEVENT":
+            continue
+        uid = _serialize(component.get("UID"))
+        if uid:
+            cache[uid] = fingerprint(component)
+    return cache
+
+
+def load_cache() -> dict:
+    if CACHE_FILE.exists():
+        return json.loads(CACHE_FILE.read_text())
+    return {}
+
+
+def save_cache(cache: dict):
+    CACHE_FILE.write_text(json.dumps(cache, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Diff
+# ---------------------------------------------------------------------------
+
+def compute_diff(old: dict, new: dict) -> tuple[set, set, set]:
+    """Return (added_uids, updated_uids, deleted_uids)."""
+    old_keys = set(old)
+    new_keys = set(new)
+    added = new_keys - old_keys
+    deleted = old_keys - new_keys
+    updated = {uid for uid in old_keys & new_keys if old[uid] != new[uid]}
+    return added, updated, deleted
+
+
+# ---------------------------------------------------------------------------
+# TimeTree fetch + ICS export
+# ---------------------------------------------------------------------------
+
+def fetch_and_export(output: str) -> tuple[str, ICalendar]:
+    """Authenticate, fetch events, build the ICalendar object. Does NOT write yet."""
     email, password, calendar_code = resolve_credentials()
 
     try:
@@ -61,24 +142,23 @@ def export_ics(output: str) -> str:
 
     labels = fetch_labels(calendar_api, calendar_id)
     cal = build_single_calendar(events, labels)
-    write_calendar(cal, output)
-    print(f"Saved: {Path(output).resolve()}")
-    return output
+    return calendar_name, cal
 
 
-def sync_to_google_calendar(ics_path: str):
+# ---------------------------------------------------------------------------
+# Google Calendar helpers
+# ---------------------------------------------------------------------------
+
+def _google_service():
     try:
         from google.oauth2.credentials import Credentials
         from google.auth.transport.requests import Request
         from google_auth_oauthlib.flow import InstalledAppFlow
         from googleapiclient.discovery import build
-        from googleapiclient.errors import HttpError
-        from icalendar import Calendar as ICalendar
-        from datetime import datetime, date
     except ImportError:
         print(
             "Google Calendar dependencies missing. Install them with:\n"
-            "  pip install google-api-python-client google-auth-oauthlib icalendar",
+            "  pip install google-api-python-client google-auth-oauthlib",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -90,8 +170,7 @@ def sync_to_google_calendar(ics_path: str):
     if not creds_file.exists():
         print(
             "credentials.json not found.\n"
-            "Download it from Google Cloud Console > APIs & Services > Credentials.\n"
-            "See the docstring at the top of this script for full setup instructions.",
+            "See the docstring at the top of this script for setup instructions.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -108,90 +187,129 @@ def sync_to_google_calendar(ics_path: str):
             creds = flow.run_local_server(port=0)
         token_file.write_text(creds.to_json())
 
-    service = build("calendar", "v3", credentials=creds)
+    return build("calendar", "v3", credentials=creds)
 
-    # Ask which calendar to import into
-    calendars_result = service.calendarList().list().execute()
-    calendars = [c for c in calendars_result.get("items", []) if c.get("accessRole") in ("owner", "writer")]
+
+def _pick_google_calendar(service) -> str:
+    """Prompt user to pick a writable Google Calendar. Returns calendar ID."""
+    result = service.calendarList().list().execute()
+    calendars = [c for c in result.get("items", []) if c.get("accessRole") in ("owner", "writer")]
 
     print("\nGoogle Calendars available:")
     for i, cal in enumerate(calendars):
         print(f"  {i + 1}. {cal['summary']}")
 
-    choice = input(f"Import into which calendar? (Default 1): ").strip() or "1"
+    choice = input("Import into which calendar? (Default 1): ").strip() or "1"
     if not choice.isdigit() or not 1 <= int(choice) <= len(calendars):
         print("Invalid choice.", file=sys.stderr)
         sys.exit(1)
 
-    target_calendar = calendars[int(choice) - 1]
-    calendar_id = target_calendar["id"]
-    print(f"Importing into: {target_calendar['summary']}")
+    target = calendars[int(choice) - 1]
+    print(f"Syncing to: {target['summary']}")
+    return target["id"]
+
+
+def _as_google_time(prop):
+    """Convert an icalendar date/datetime property to a Google Calendar time dict."""
+    val = prop.dt if hasattr(prop, "dt") else prop
+    if isinstance(val, datetime):
+        if val.tzinfo:
+            return {"dateTime": val.isoformat(), "timeZone": str(val.tzinfo)}
+        return {"dateTime": val.isoformat() + "Z", "timeZone": "UTC"}
+    return {"date": val.isoformat()}
+
+
+def _build_event_body(component) -> dict:
+    dtstart = component.get("DTSTART")
+    dtend = component.get("DTEND")
+    body = {
+        "summary": _serialize(component.get("SUMMARY")) or "(no title)",
+        "start": _as_google_time(dtstart),
+        "end": _as_google_time(dtend) if dtend else _as_google_time(dtstart),
+        "iCalUID": _serialize(component.get("UID")),
+    }
+    if component.get("DESCRIPTION"):
+        body["description"] = _serialize(component.get("DESCRIPTION"))
+    if component.get("LOCATION"):
+        body["location"] = _serialize(component.get("LOCATION"))
+    return body
+
+
+def _find_google_event_id(service, calendar_id: str, ical_uid: str) -> str | None:
+    result = service.events().list(calendarId=calendar_id, iCalUID=ical_uid).execute()
+    items = result.get("items", [])
+    return items[0]["id"] if items else None
+
+
+def apply_diff_to_google(service, calendar_id: str, ics_path: str,
+                         added: set, updated: set, deleted: set):
+    from googleapiclient.errors import HttpError
 
     with open(ics_path, "rb") as f:
         cal = ICalendar.from_ical(f.read())
 
-    imported = skipped = errors = 0
+    components_by_uid = {
+        _serialize(c.get("UID")): c
+        for c in cal.walk()
+        if c.name == "VEVENT" and c.get("UID")
+    }
 
-    for component in cal.walk():
-        if component.name != "VEVENT":
+    inserted = patched = removed = errors = 0
+
+    for uid in added:
+        component = components_by_uid.get(uid)
+        if not component:
             continue
-
-        def to_rfc3339(dt_val):
-            if isinstance(dt_val, datetime):
-                if dt_val.tzinfo is None:
-                    return dt_val.isoformat() + "Z"
-                return dt_val.isoformat()
-            if isinstance(dt_val, date):
-                return dt_val.isoformat()
-            return str(dt_val)
-
-        def as_date_or_datetime(prop):
-            val = prop.dt if hasattr(prop, "dt") else prop
-            if isinstance(val, datetime):
-                if val.tzinfo:
-                    return {"dateTime": val.isoformat(), "timeZone": str(val.tzinfo)}
-                return {"dateTime": val.isoformat() + "Z", "timeZone": "UTC"}
-            return {"date": val.isoformat()}
-
-        summary = str(component.get("SUMMARY", "")).strip() or "(no title)"
-        dtstart = component.get("DTSTART")
-        dtend = component.get("DTEND")
-
-        if not dtstart:
-            skipped += 1
-            continue
-
-        event_body = {"summary": summary, "start": as_date_or_datetime(dtstart)}
-
-        if dtend:
-            event_body["end"] = as_date_or_datetime(dtend)
-        else:
-            event_body["end"] = event_body["start"]
-
-        if component.get("DESCRIPTION"):
-            event_body["description"] = str(component["DESCRIPTION"])
-        if component.get("LOCATION"):
-            event_body["location"] = str(component["LOCATION"])
-        if component.get("UID"):
-            event_body["iCalUID"] = str(component["UID"])
-
         try:
-            service.events().import_(calendarId=calendar_id, body=event_body).execute()
-            imported += 1
+            service.events().insert(calendarId=calendar_id, body=_build_event_body(component)).execute()
+            inserted += 1
         except HttpError as e:
-            if e.resp.status == 409:
-                # Duplicate event (already exists by iCalUID)
-                skipped += 1
-            else:
-                print(f"  Error importing '{summary}': {e}", file=sys.stderr)
+            print(f"  Error inserting '{uid}': {e}", file=sys.stderr)
+            errors += 1
+
+    for uid in updated:
+        component = components_by_uid.get(uid)
+        if not component:
+            continue
+        google_id = _find_google_event_id(service, calendar_id, uid)
+        if not google_id:
+            # Not found remotely — insert instead
+            try:
+                service.events().insert(calendarId=calendar_id, body=_build_event_body(component)).execute()
+                inserted += 1
+            except HttpError as e:
+                print(f"  Error inserting (fallback) '{uid}': {e}", file=sys.stderr)
                 errors += 1
+            continue
+        try:
+            service.events().patch(calendarId=calendar_id, eventId=google_id,
+                                   body=_build_event_body(component)).execute()
+            patched += 1
+        except HttpError as e:
+            print(f"  Error updating '{uid}': {e}", file=sys.stderr)
+            errors += 1
 
-    print(f"Done: {imported} imported, {skipped} skipped (duplicates), {errors} errors")
+    for uid in deleted:
+        google_id = _find_google_event_id(service, calendar_id, uid)
+        if not google_id:
+            continue
+        try:
+            service.events().delete(calendarId=calendar_id, eventId=google_id).execute()
+            removed += 1
+        except HttpError as e:
+            print(f"  Error deleting '{uid}': {e}", file=sys.stderr)
+            errors += 1
 
+    print(f"Google Calendar: +{inserted} added, ~{patched} updated, -{removed} deleted, {errors} errors")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Export TimeTree to .ics and optionally sync to Google Calendar"
+        description="Export TimeTree to .ics, diff against last run, sync changes to Google Calendar"
     )
     parser.add_argument(
         "-o", "--output",
@@ -201,24 +319,51 @@ def main():
     parser.add_argument(
         "--google-calendar",
         action="store_true",
-        help="After exporting, import events into Google Calendar",
+        help="Sync the diff to Google Calendar",
     )
     parser.add_argument(
-        "--google-only",
+        "--force",
         action="store_true",
-        help="Skip TimeTree export and import an existing .ics file into Google Calendar",
+        help="Rewrite the ICS and push all events even if nothing changed",
     )
     args = parser.parse_args()
 
-    if args.google_only:
-        if not Path(args.output).exists():
-            print(f"File not found: {args.output}", file=sys.stderr)
-            sys.exit(1)
-        sync_to_google_calendar(args.output)
+    calendar_name, cal = fetch_and_export(args.output)
+
+    # Write ICS to a temp location so we can parse it for diffing
+    tmp_path = args.output + ".tmp"
+    write_calendar(cal, tmp_path)
+
+    old_cache = load_cache()
+    new_cache = ics_to_cache(tmp_path)
+    added, updated, deleted = compute_diff(old_cache, new_cache)
+
+    has_changes = bool(added or updated or deleted)
+
+    if not has_changes and not args.force:
+        print("No changes detected — ICS and Google Calendar are already up to date.")
+        Path(tmp_path).unlink(missing_ok=True)
+        return
+
+    if has_changes:
+        print(f"Changes: +{len(added)} added, ~{len(updated)} updated, -{len(deleted)} deleted")
     else:
-        ics_path = export_ics(args.output)
-        if args.google_calendar:
-            sync_to_google_calendar(ics_path)
+        print("No changes, but --force set — rewriting anyway.")
+
+    # Promote tmp → real ICS
+    Path(tmp_path).replace(args.output)
+    print(f"Saved: {Path(args.output).resolve()}")
+
+    save_cache(new_cache)
+
+    if args.google_calendar:
+        service = _google_service()
+        calendar_id = _pick_google_calendar(service)
+        if args.force:
+            # Treat everything as added on --force
+            apply_diff_to_google(service, calendar_id, args.output, new_cache.keys(), set(), set())
+        else:
+            apply_diff_to_google(service, calendar_id, args.output, added, updated, deleted)
 
 
 if __name__ == "__main__":
