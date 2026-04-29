@@ -400,14 +400,48 @@ def _event_body(component) -> dict:
     return body
 
 
+_BATCH_SIZE = 50  # Google Calendar API limit per batch request
+
+
 def _find_google_id(service, calendar_id: str, ical_uid: str) -> str | None:
     items = service.events().list(calendarId=calendar_id, iCalUID=ical_uid).execute().get("items", [])
     return items[0]["id"] if items else None
 
 
+def _run_batches(service, requests: list, label: str) -> tuple[int, int]:
+    """Execute a list of API request objects in batches of _BATCH_SIZE.
+    Returns (successes, errors)."""
+    ok = 0
+    err = 0
+    total = len(requests)
+
+    for start in range(0, total, _BATCH_SIZE):
+        chunk = requests[start:start + _BATCH_SIZE]
+        counters = {"ok": 0, "err": 0}
+
+        def callback(request_id, response, exception, _c=counters):
+            if exception:
+                _c["err"] += 1
+            else:
+                _c["ok"] += 1
+
+        batch = service.new_batch_http_request(callback=callback)
+        for req in chunk:
+            batch.add(req)
+        batch.execute()
+
+        ok  += counters["ok"]
+        err += counters["err"]
+        done = min(start + _BATCH_SIZE, total)
+        print(f"\r  {label}: {done}/{total}", end="", flush=True)
+
+    if total:
+        print()  # newline after progress line
+    return ok, err
+
+
 def apply_diff_to_google(service, calendar_id: str, ics_path: str,
                          added: set, updated: set, deleted: set):
-    from googleapiclient.errors import HttpError
     from icalendar import Calendar as ICal
 
     with open(ics_path, "rb") as f:
@@ -421,41 +455,55 @@ def apply_diff_to_google(service, calendar_id: str, ics_path: str,
 
     inserted = patched = removed = errors = 0
 
-    for uid in added:
-        if not (c := by_uid.get(uid)):
-            continue
-        try:
-            service.events().insert(calendarId=calendar_id, body=_event_body(c)).execute()
-            inserted += 1
-        except HttpError as exc:
-            print(f"  insert error {uid}: {exc}", file=sys.stderr)
-            errors += 1
+    # ── Inserts (batched) ──────────────────────────────────────────────────
+    if added:
+        reqs = [
+            service.events().insert(calendarId=calendar_id, body=_event_body(by_uid[uid]))
+            for uid in added
+            if uid in by_uid
+        ]
+        ok, err = _run_batches(service, reqs, "Inserting")
+        inserted += ok
+        errors   += err
 
-    for uid in updated:
-        if not (c := by_uid.get(uid)):
-            continue
-        gid = _find_google_id(service, calendar_id, uid)
-        try:
+    # ── Updates (need a lookup per UID, then batch the patches) ───────────
+    if updated:
+        patch_reqs = []
+        insert_reqs = []
+        print(f"  Looking up {len(updated)} changed events...", flush=True)
+        for uid in updated:
+            if not (c := by_uid.get(uid)):
+                continue
+            gid = _find_google_id(service, calendar_id, uid)
             if gid:
-                service.events().patch(calendarId=calendar_id, eventId=gid, body=_event_body(c)).execute()
-                patched += 1
+                patch_reqs.append(
+                    service.events().patch(calendarId=calendar_id, eventId=gid, body=_event_body(c))
+                )
             else:
-                service.events().insert(calendarId=calendar_id, body=_event_body(c)).execute()
-                inserted += 1
-        except HttpError as exc:
-            print(f"  update error {uid}: {exc}", file=sys.stderr)
-            errors += 1
+                insert_reqs.append(
+                    service.events().insert(calendarId=calendar_id, body=_event_body(c))
+                )
+        if patch_reqs:
+            ok, err = _run_batches(service, patch_reqs, "Updating")
+            patched += ok
+            errors  += err
+        if insert_reqs:
+            ok, err = _run_batches(service, insert_reqs, "Inserting (new)")
+            inserted += ok
+            errors   += err
 
-    for uid in deleted:
-        gid = _find_google_id(service, calendar_id, uid)
-        if not gid:
-            continue
-        try:
-            service.events().delete(calendarId=calendar_id, eventId=gid).execute()
-            removed += 1
-        except HttpError as exc:
-            print(f"  delete error {uid}: {exc}", file=sys.stderr)
-            errors += 1
+    # ── Deletes (need a lookup per UID, then batch the deletes) ───────────
+    if deleted:
+        print(f"  Looking up {len(deleted)} deleted events...", flush=True)
+        del_reqs = []
+        for uid in deleted:
+            gid = _find_google_id(service, calendar_id, uid)
+            if gid:
+                del_reqs.append(service.events().delete(calendarId=calendar_id, eventId=gid))
+        if del_reqs:
+            ok, err = _run_batches(service, del_reqs, "Deleting")
+            removed += ok
+            errors  += err
 
     print(f"Google Calendar: +{inserted} added  ~{patched} updated  -{removed} deleted  {errors} errors")
 
