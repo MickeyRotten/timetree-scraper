@@ -6,3 +6,4 @@ credentials.json
 token.json
 *.ics
 timetree_cache.json
+.timetree_sync.json
