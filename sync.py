@@ -15,7 +15,7 @@ import importlib.util
 import json
 import subprocess
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 SCRIPT_DIR  = Path(__file__).parent
@@ -338,7 +338,12 @@ def fetch_ical(cfg: dict):
 
     print(f"Fetching events from '{cal_name}'...", flush=True)
     events = api.get_events(cal_id, cal_name)
-    print(f"  {len(events)} events found")
+
+    # Drop events that ended before today (timestamps are milliseconds)
+    today_ms = int(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+    events = [e for e in events if (e.get("end_at") or e.get("start_at") or 0) >= today_ms]
+
+    print(f"  {len(events)} events from today onwards")
 
     labels = fetch_labels(api, cal_id)
     return build_single_calendar(events, labels)
